@@ -57,6 +57,10 @@ def _notify():
     return current_app.config["NOTIFY"]
 
 
+def _baselines():
+    return current_app.config["BASELINES"]
+
+
 def _payload() -> dict:
     return request.get_json(silent=True) or {}
 
@@ -465,6 +469,69 @@ def build_coverage(build_id: str):
 @api.get("/projects/<project_id>/coverage/trend")
 def coverage_trend(project_id: str):
     return jsonify(_coverage().trend(project_id))
+
+
+# ---------------------------------------------------------------------------
+# 发布基线
+# ---------------------------------------------------------------------------
+
+@api.get("/projects/<project_id>/baselines")
+def list_baselines(project_id: str):
+    return jsonify({"baselines": _baselines().list(project_id)})
+
+
+@api.post("/projects/<project_id>/baselines")
+def create_baseline(project_id: str):
+    data = _payload()
+    build_id = data.get("build_id")
+    if not build_id:
+        return _err("缺少 build_id")
+    baseline = _baselines().create(project_id, build_id,
+                                   label=data.get("label", ""),
+                                   note=data.get("note", ""))
+    if "error" in baseline:
+        return _err(baseline["error"])
+    return jsonify(baseline)
+
+
+@api.get("/baselines/<baseline_id>")
+def get_baseline(baseline_id: str):
+    baseline = _baselines().get(baseline_id)
+    if baseline is None:
+        return _err("基线不存在", 404)
+    return jsonify(baseline)
+
+
+@api.put("/baselines/<baseline_id>")
+def update_baseline(baseline_id: str):
+    if _baselines().get(baseline_id) is None:
+        return _err("基线不存在", 404)
+    data = _payload()
+    updated = _baselines().update(baseline_id, data)
+    if updated is None:
+        return _err("标签为空或与本项目其他基线重复")
+    return jsonify(updated)
+
+
+@api.delete("/baselines/<baseline_id>")
+def delete_baseline(baseline_id: str):
+    _baselines().delete(baseline_id)
+    return jsonify({"ok": True})
+
+
+@api.get("/builds/<build_id>/compare")
+def compare_build(build_id: str):
+    """把一次构建与指定基线对比（通过率 / 失败 / 耗时 / 覆盖率 / 缺陷）。"""
+    build, err = _build_or_404(build_id)
+    if err:
+        return err
+    baseline_id = request.args.get("baseline_id")
+    if not baseline_id:
+        return _err("缺少 baseline_id 参数")
+    diff = _baselines().compare(build["project_id"], baseline_id, build_id)
+    if "error" in diff:
+        return _err(diff["error"], 404)
+    return jsonify(diff)
 
 
 # ---------------------------------------------------------------------------

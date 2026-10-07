@@ -11,6 +11,9 @@
     .build-item:hover { border-color: var(--primary); }
     .build-item.active { border-color: var(--primary); background: var(--primary-soft); }
     .build-list { max-height: 520px; overflow: auto; }
+    .delta-up { color: var(--green); font-weight: 600; }
+    .delta-down { color: var(--red); font-weight: 600; }
+    .delta-flat { color: var(--text-muted); }
   </style>
 </head>
 <body>
@@ -25,6 +28,8 @@
       <div class="row">
         <label style="margin:0 6px 0 0;align-self:center">项目</label>
         <select id="project-select" style="max-width:240px" onchange="switchProject(this.value)"></select>
+        <label style="margin:0 6px 0 6px;align-self:center">基线</label>
+        <select id="baseline-select" style="max-width:320px" onchange="onBaselineChange()"></select>
         <span style="flex:1"></span>
         <button class="btn secondary" id="btn-refresh">刷新</button>
       </div>
@@ -68,8 +73,23 @@ async function switchProject(id) { projectId = id; currentBuild = null; await lo
 
 async function loadAll() {
   if (!projectId) return;
-  await Promise.all([loadBuilds(), loadTrend()]);
+  await Promise.all([loadBuilds(), loadTrend(), loadBaselines()]);
 }
+
+/* ---------- 发布基线 ---------- */
+async function loadBaselines() {
+  const d = await api(`/api/projects/${projectId}/baselines`);
+  const baselines = d.baselines || [];
+  const sel = $("#baseline-select");
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— 不对比基线 —</option>' +
+    baselines.map(b => `<option value="${b.id}">${esc(b.label)} · 覆盖率 ${b.coverage_percent ?? "—"}%</option>`).join("");
+  if (baselines.some(b => b.id === prev)) sel.value = prev;
+}
+
+function currentBaselineId() { return $("#baseline-select").value || null; }
+
+async function onBaselineChange() { if (currentBuild) selectBuild(currentBuild); }
 
 async function loadBuilds() {
   const d = await api(`/api/builds?project_id=${projectId}`);
@@ -98,13 +118,40 @@ async function selectBuild(id) {
   currentBuild = id;
   loadBuilds();
   const c = await api(`/api/builds/${id}/coverage`);
-  renderCoverage(c);
+  let diff = null;
+  const bid = currentBaselineId();
+  if (bid) {
+    try { diff = await api(`/api/builds/${id}/compare?baseline_id=${bid}`); }
+    catch (e) { toast(e.message, "err"); }
+  }
+  renderCoverage(c, diff);
 }
 
-function renderCoverage(c) {
+function deltaHtml(delta, unit, goodWhenUp) {
+  const d = Number(delta || 0);
+  const cls = d === 0 ? "delta-flat" : ((d > 0) === goodWhenUp ? "delta-up" : "delta-down");
+  return `<span class="${cls}">${d > 0 ? "+" : ""}${d.toFixed(1)}${unit}</span>`;
+}
+
+function renderCoverage(c, diff) {
   $("#cov-title").textContent = `覆盖率详情 · ${c.percent}%`;
   const files = c.files || [];
+  const covDiff = diff && diff.coverage ? diff.coverage : null;
+  const base = diff && diff.baseline ? diff.baseline : null;
+  const fileDeltas = {};
+  if (covDiff) (covDiff.files || []).forEach(f => { fileDeltas[f.file] = f; });
   $("#cov-body").innerHTML = `
+    ${covDiff ? `<div class="mt" style="border:1px solid var(--primary);border-radius:10px;padding:12px 14px">
+      <h3 style="margin-top:0">对比基线 · ${esc(base.label || "")}
+        <span class="muted" style="font-size:12px;font-weight:400">（基线构建 ${esc(base.build_name || base.build_id)} · 固化于 ${fmtTime(base.created_at)}）</span></h3>
+      <div class="grid cols-3">
+        <div class="stat"><div class="v">${deltaHtml(covDiff.percent.delta, "%", true)}</div>
+          <div class="k">总覆盖率差异（${covDiff.percent.baseline}% → ${covDiff.percent.current}%）</div></div>
+        <div class="stat"><div class="v">${covDiff.covered_lines.delta > 0 ? "+" : ""}${covDiff.covered_lines.delta}</div>
+          <div class="k">覆盖行差异（${covDiff.covered_lines.baseline} → ${covDiff.covered_lines.current}）</div></div>
+        <div class="stat"><div class="v">${(covDiff.files || []).filter(f => f.delta < 0).length}</div>
+          <div class="k">覆盖率下降的文件数</div></div>
+      </div></div>` : ""}
     <div class="grid cols-3 mt">
       <div class="stat primary"><div class="v">${c.percent}%</div><div class="k">总体覆盖率</div></div>
       <div class="stat good"><div class="v">${c.covered_lines}</div><div class="k">覆盖行</div></div>
@@ -114,7 +161,9 @@ function renderCoverage(c) {
       <div class="cov-row">
         <span class="fname" title="${esc(f.file)}">${esc(f.file)}</span>
         <div class="bar ${f.percent>=80?'green':f.percent>=50?'amber':'red'}"><i style="width:${f.percent}%"></i></div>
-        <span class="pct">${f.percent}%</span>
+        <span class="pct">${f.percent}%${fileDeltas[f.file] && fileDeltas[f.file].delta !== 0
+          ? ` <span class="${fileDeltas[f.file].delta > 0 ? 'delta-up' : 'delta-down'}" style="font-size:11px">(${fileDeltas[f.file].delta > 0 ? "+" : ""}${fileDeltas[f.file].delta})</span>`
+          : ""}</span>
       </div>`).join("")}</div>
     <div class="mt muted" style="font-size:12px">模拟源码树 · 共 ${c.total_lines} 行，覆盖 ${c.covered_lines} 行。</div>`;
 }

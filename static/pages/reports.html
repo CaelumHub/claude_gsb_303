@@ -15,6 +15,9 @@
     .trend .col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; }
     .trend .col .bar-v { width: 100%; max-width: 40px; border-radius: 5px 5px 0 0; }
     .trend .col .lbl { font-size: 10px; color: var(--text-muted); transform: rotate(0); white-space: nowrap; }
+    .delta-up { color: var(--green); font-weight: 600; }
+    .delta-down { color: var(--red); font-weight: 600; }
+    .delta-flat { color: var(--text-muted); }
   </style>
 </head>
 <body>
@@ -33,6 +36,17 @@
         <button class="btn secondary" id="btn-refresh">刷新</button>
       </div>
     </div>
+
+    <!-- 发布基线 -->
+    <section class="card">
+      <h2>发布基线</h2>
+      <div class="row">
+        <select id="baseline-select" style="max-width:320px" onchange="onBaselineChange()"></select>
+        <button class="btn" id="btn-create-baseline">将选中构建设为基线</button>
+        <button class="btn secondary" id="btn-delete-baseline">删除基线</button>
+        <span class="muted" style="font-size:12px" id="baseline-hint">选择基线后，报告详情将显示本次构建相对基线的差异。</span>
+      </div>
+    </section>
 
     <!-- 项目趋势 -->
     <section class="card">
@@ -61,6 +75,7 @@ renderNav("reports");
 let projectId = null;
 let builds = [];
 let currentBuild = null;
+let baselines = [];
 
 async function init() {
   const params = new URLSearchParams(location.search);
@@ -73,8 +88,54 @@ async function switchProject(id) { projectId = id; currentBuild = null; await lo
 
 async function loadAll() {
   if (!projectId) return;
-  await Promise.all([loadTrend(), loadBuilds()]);
+  await Promise.all([loadTrend(), loadBuilds(), loadBaselines()]);
 }
+
+/* ---------- 发布基线 ---------- */
+async function loadBaselines() {
+  const d = await api(`/api/projects/${projectId}/baselines`);
+  baselines = d.baselines || [];
+  const sel = $("#baseline-select");
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— 不对比基线 —</option>' +
+    baselines.map(b => `<option value="${b.id}">${esc(b.label)} · ${esc(b.build_name||b.build_id)} · 通过率 ${b.pass_rate ?? "—"}% · 覆盖率 ${b.coverage_percent ?? "—"}%</option>`).join("");
+  if (baselines.some(b => b.id === prev)) sel.value = prev;
+}
+
+function currentBaselineId() { return $("#baseline-select").value || null; }
+
+async function onBaselineChange() { if (currentBuild) selectBuild(currentBuild); }
+
+$("#btn-create-baseline").onclick = async () => {
+  if (!currentBuild) { toast("请先在左侧选择一个构建", "err"); return; }
+  const label = prompt("基线标签（如版本号 v2.31.0）：");
+  if (!label) return;
+  const note = prompt("备注（可选）：") || "";
+  const btn = $("#btn-create-baseline");
+  setLoading(btn, true, "固化中…");
+  try {
+    await api(`/api/projects/${projectId}/baselines`, {
+      method: "POST",
+      body: { build_id: currentBuild, label, note },
+    });
+    toast("基线已固化");
+    await loadBaselines();
+    selectBuild(currentBuild);
+  } catch (e) { toast(e.message, "err"); }
+  finally { setLoading(btn, false); }
+};
+
+$("#btn-delete-baseline").onclick = async () => {
+  const bid = currentBaselineId();
+  if (!bid) { toast("请先选择要删除的基线", "err"); return; }
+  if (!confirm("确定删除该基线？删除后不可恢复。")) return;
+  try {
+    await api(`/api/baselines/${bid}`, { method: "DELETE" });
+    toast("基线已删除");
+    await loadBaselines();
+    if (currentBuild) selectBuild(currentBuild);
+  } catch (e) { toast(e.message, "err"); }
+};
 
 async function loadTrend() {
   const d = await api(`/api/projects/${projectId}/reports?limit=15`);
@@ -109,10 +170,78 @@ async function selectBuild(id) {
   currentBuild = id;
   loadBuilds();
   const r = await api(`/api/builds/${id}/report`);
-  renderReport(r);
+  let diff = null;
+  const bid = currentBaselineId();
+  if (bid) {
+    try { diff = await api(`/api/builds/${id}/compare?baseline_id=${bid}`); }
+    catch (e) { toast(e.message, "err"); }
+  }
+  renderReport(r, diff);
 }
 
-function renderReport(r) {
+/* 差异数值着色：good 方向（越大越好）或 bad 方向（越大越差） */
+function deltaHtml(delta, unit, goodWhenUp, digits = 1) {
+  const d = Number(delta || 0);
+  const cls = d === 0 ? "delta-flat" : ((d > 0) === goodWhenUp ? "delta-up" : "delta-down");
+  const sign = d > 0 ? "+" : "";
+  return `<span class="${cls}">${sign}${d.toFixed(digits)}${unit}</span>`;
+}
+
+function renderDiff(diff) {
+  if (!diff) return "";
+  const rp = diff.report || {};
+  const cov = diff.coverage || {};
+  const def = diff.defects || {};
+  const b = diff.baseline || {};
+  const dur = rp.duration || {};
+  const p95 = (rp.durations || {}).p95 || {};
+  const newFails = rp.new_failures || [];
+  const resolved = rp.resolved_failures || [];
+  const newDefects = def.new_since_baseline || [];
+  const durBadge = dur.regressed ? '<span class="badge failed">耗时退化</span>' : "";
+  const p95Badge = p95.regressed ? '<span class="badge failed">P95 退化</span>' : "";
+
+  return `<div class="mt" style="border:1px solid var(--primary);border-radius:10px;padding:12px 14px">
+    <h3 style="margin-top:0">对比基线 · ${esc(b.label || "")}
+      <span class="muted" style="font-size:12px;font-weight:400">（基线构建 ${esc(b.build_name || b.build_id)} · 固化于 ${fmtTime(b.created_at)}）</span>
+      ${durBadge}${p95Badge}</h3>
+    <div class="grid cols-4">
+      <div class="stat"><div class="v">${deltaHtml((rp.pass_rate||{}).delta, "%", true)}</div>
+        <div class="k">通过率差异（${(rp.pass_rate||{}).baseline ?? 0}% → ${(rp.pass_rate||{}).current ?? 0}%）</div></div>
+      <div class="stat"><div class="v">${deltaHtml((rp.failed||{}).delta, "", false, 0)}</div>
+        <div class="k">失败数差异（${(rp.failed||{}).baseline ?? 0} → ${(rp.failed||{}).current ?? 0}）</div></div>
+      <div class="stat"><div class="v">${deltaHtml(dur.delta, "s", false, 2)}</div>
+        <div class="k">总耗时差异（${fmtDur(dur.baseline)} → ${fmtDur(dur.current)}）</div></div>
+      <div class="stat"><div class="v">${deltaHtml((cov.percent||{}).delta, "%", true)}</div>
+        <div class="k">覆盖率差异（${(cov.percent||{}).baseline ?? 0}% → ${(cov.percent||{}).current ?? 0}%）</div></div>
+    </div>
+    <div class="mt grid cols-4">
+      <div class="stat"><div class="v">${rp.new_failure_count || 0}</div><div class="k">新增失败用例</div></div>
+      <div class="stat"><div class="v">${rp.resolved_failure_count || 0}</div><div class="k">相对基线已修复</div></div>
+      <div class="stat"><div class="v">${deltaHtml(p95.delta, "s", false, 2)}</div>
+        <div class="k">P95 耗时差异（阈值 ±${rp.regression_threshold_pct ?? 10}%）</div></div>
+      <div class="stat"><div class="v">${deltaHtml((def.total||{}).delta, "", false, 0)}</div>
+        <div class="k">缺陷总数差异（${(def.total||{}).baseline ?? 0} → ${(def.total||{}).current ?? 0}）</div></div>
+    </div>
+
+    ${newFails.length ? `<div class="mt"><h3>新增失败（相对基线）</h3><table>
+      <thead><tr><th>用例</th><th>状态</th><th>原因</th><th>耗时</th></tr></thead>
+      <tbody>${newFails.map(f => `<tr><td>${esc(f.case_name||f.case_id)}</td><td>${statusBadge(f.status)}</td>
+        <td class="muted" style="font-size:13px">${esc(f.reason||"")}</td><td>${fmtDur(f.duration)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+
+    ${resolved.length ? `<div class="mt"><h3>已修复（基线中失败、本次通过）</h3><table>
+      <thead><tr><th>用例</th><th>基线状态</th><th>基线原因</th></tr></thead>
+      <tbody>${resolved.map(f => `<tr><td>${esc(f.case_name||f.case_id)}</td><td>${statusBadge(f.status)}</td>
+        <td class="muted" style="font-size:13px">${esc(f.reason||"")}</td></tr>`).join("")}</tbody></table></div>` : ""}
+
+    ${newDefects.length ? `<div class="mt"><h3>基线固化后新增缺陷（${def.new_since_baseline_count}）</h3><table>
+      <thead><tr><th>缺陷</th><th>严重级别</th><th>状态</th><th>创建时间</th></tr></thead>
+      <tbody>${newDefects.map(d => `<tr><td>${esc(d.title)}</td><td><span class="tag">${esc(d.severity)}</span></td>
+        <td>${statusBadge(d.status)}</td><td class="muted" style="font-size:12px">${fmtTime(d.created_at)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+  </div>`;
+}
+
+function renderReport(r, diff) {
   $("#report-title").textContent = r.name || r.build_id;
   const s = r.summary || {};
   const d = r.durations || {};
@@ -122,6 +251,7 @@ function renderReport(r) {
   const slowest = r.slowest || [];
 
   $("#report-body").innerHTML = `
+    ${renderDiff(diff)}
     <div class="grid cols-4 mt">
       <div class="stat primary"><div class="v">${s.total||0}</div><div class="k">总用例</div></div>
       <div class="stat good"><div class="v">${s.pass_rate ?? 0}%</div><div class="k">通过率</div></div>
