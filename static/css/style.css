@@ -261,6 +261,20 @@ td .mono { font-size: 12px; color: var(--text-muted); }
 
 .empty { text-align: center; color: var(--text-muted); padding: 30px 0; }
 
+/* ---------- 基线对比差异 ---------- */
+.delta { font-weight: 600; font-size: 12px; white-space: nowrap; }
+.delta.up { color: var(--green); }
+.delta.down { color: var(--red); }
+.delta.zero { color: var(--text-muted); font-weight: 500; }
+.diff-card { border: 1px dashed var(--primary); background: var(--primary-soft);
+  border-radius: var(--radius); padding: 16px 18px; margin-bottom: 20px; }
+.diff-card h2 { color: var(--primary); }
+.diff-card .delta-list span { margin-right: 14px; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+.pill.new { background:#fdecec; color:var(--red); }
+.pill.fixed { background:#e7f6ec; color:var(--green); }
+.pill.keep { background:#f1f5f9; color:#64748b; }
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 900px) {
   .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }

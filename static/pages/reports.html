@@ -30,9 +30,26 @@
         <label style="margin:0 6px 0 0;align-self:center">项目</label>
         <select id="project-select" style="max-width:240px" onchange="switchProject(this.value)"></select>
         <span style="flex:1"></span>
+        <button class="btn secondary" id="btn-manage-baselines">管理基线</button>
         <button class="btn secondary" id="btn-refresh">刷新</button>
       </div>
     </div>
+
+    <!-- 发布基线对比 -->
+    <section class="diff-card" id="baseline-card">
+      <div class="row spread">
+        <h2 style="margin:0">发布基线对比</h2>
+        <span class="muted" style="font-size:12px">通过率/耗时取构建结果 · 覆盖率取覆盖率快照 · 缺陷取缺陷列表，均为基线固化时的口径</span>
+      </div>
+      <div class="row mt">
+        <label style="margin:0;align-self:center">对比基线</label>
+        <select id="baseline-select" style="max-width:260px" onchange="onBaselineChange(this.value)"></select>
+        <button class="btn small green" id="btn-save-baseline">把当前构建存为基线…</button>
+        <span class="muted" id="baseline-meta" style="font-size:12px"></span>
+        <span style="flex:1"></span>
+      </div>
+      <div id="baseline-diff" class="mt"><div class="empty" style="padding:14px 0">选择一条历史基线，查看本次构建相对它的新增失败、覆盖率升降与耗时退化。</div></div>
+    </section>
 
     <!-- 项目趋势 -->
     <section class="card">
@@ -61,6 +78,10 @@ renderNav("reports");
 let projectId = null;
 let builds = [];
 let currentBuild = null;
+let baselines = [];
+let currentBaselineId = null;
+
+function blKey() { return `baseline:reports:${projectId}`; }
 
 async function init() {
   const params = new URLSearchParams(location.search);
@@ -69,11 +90,39 @@ async function init() {
   if (builds[0]) selectBuild(builds[0].id);
 }
 
-async function switchProject(id) { projectId = id; currentBuild = null; await loadAll(); }
+async function switchProject(id) {
+  projectId = id; currentBuild = null; currentBaselineId = null;
+  await loadAll();
+  if (builds[0]) selectBuild(builds[0].id);
+}
 
 async function loadAll() {
   if (!projectId) return;
-  await Promise.all([loadTrend(), loadBuilds()]);
+  await Promise.all([loadTrend(), loadBuilds(), loadBaselines()]);
+}
+
+async function loadBaselines(keepSelection = true) {
+  const d = await api(`/api/projects/${projectId}/baselines`);
+  baselines = d.baselines || [];
+  const sel = $("#baseline-select");
+  if (!baselines.length) {
+    sel.innerHTML = '<option value="">（暂无基线）</option>';
+    currentBaselineId = null;
+  } else {
+    const saved = keepSelection ? (localStorage.getItem(blKey()) || currentBaselineId) : null;
+    sel.innerHTML = '<option value="">不对比</option>' + baselines.map(b =>
+      `<option value="${b.id}">${esc(b.tag)} · ${esc(b.build_name||"")}</option>`).join("");
+    if (saved && baselines.some(b => b.id === saved)) {
+      currentBaselineId = saved;
+    } else if (keepSelection === false) {
+      currentBaselineId = null;            // 显式重载（保存/管理）时保留「不对比」
+    } else {
+      currentBaselineId = baselines[0].id; // 默认拿最新一条基线对比
+      localStorage.setItem(blKey(), currentBaselineId);
+    }
+    sel.value = currentBaselineId || "";
+  }
+  await renderBaselineDiff();
 }
 
 async function loadTrend() {
@@ -110,7 +159,126 @@ async function selectBuild(id) {
   loadBuilds();
   const r = await api(`/api/builds/${id}/report`);
   renderReport(r);
+  renderBaselineDiff();
 }
+
+async function onBaselineChange(value) {
+  currentBaselineId = value || null;
+  if (currentBaselineId) localStorage.setItem(blKey(), currentBaselineId);
+  else localStorage.removeItem(blKey());
+  renderBaselineDiff();
+}
+
+async function renderBaselineDiff() {
+  const host = $("#baseline-diff");
+  const meta = $("#baseline-meta");
+  meta.textContent = "";
+  if (!currentBuild || !currentBaselineId) {
+    host.innerHTML = '<div class="empty" style="padding:14px 0">选择一条历史基线，查看本次构建相对它的新增失败、覆盖率升降与耗时退化。</div>';
+    return;
+  }
+  const bl = baselines.find(b => b.id === currentBaselineId);
+  if (bl) meta.textContent = `基线 ${bl.tag} 固化于 ${fmtTime(bl.frozen_at)} · 基线构建 ${bl.build_name||bl.build_id}`;
+  host.innerHTML = '<div class="empty" style="padding:10px 0">对比中…</div>';
+  let d;
+  try {
+    d = await api(`/api/builds/${currentBuild}/baseline-compare?baseline_id=${currentBaselineId}`);
+  } catch (e) { host.innerHTML = `<div class="empty" style="padding:10px 0;color:var(--red)">${esc(e.message)}</div>`; return; }
+  host.innerHTML = renderDiffHtml(d);
+}
+
+function renderDiffHtml(d) {
+  const s = d.summary || {}, du = d.durations || {}, cov = d.coverage || {},
+        fl = d.failures || {}, de = d.defects || {};
+  const pct = x => (x == null ? "—" : Number(x).toFixed(1) + "%");
+  const ds = de.stats || {};
+  const cs = ds.current || {}, bs = ds.baseline || {};
+  return `
+  <div class="grid cols-4">
+    ${deltaStat("通过率", s.pass_rate || {}, pct, { suffix: "%", goodUp: true })}
+    <div class="stat">
+      <div class="v" style="font-size:18px">${s.fail_count ? s.fail_count.current : 0} ${deltaSpan((s.fail_count||{}).delta, { suffix: "", goodUp: false, digits: 0 })}</div>
+      <div class="k">失败/错误/超时 · 基线 ${s.fail_count ? s.fail_count.baseline : 0} · <span style="color:var(--red)">新增 ${fl.new_count||0}</span> / <span style="color:var(--green)">修复 ${fl.fixed_count||0}</span></div>
+    </div>
+    ${deltaStat("覆盖率", cov.percent || {}, pct, { suffix: "%", goodUp: true })}
+    ${deltaStat("构建总耗时", s.build_duration || {}, fmtDur, { suffix: "", goodUp: false })}
+  </div>
+  <div class="grid cols-4 mt">
+    ${deltaStat("平均用例耗时", du.avg || {}, fmtDur, { goodUp: false })}
+    ${deltaStat("中位耗时", du.median || {}, fmtDur, { goodUp: false })}
+    ${deltaStat("P95 耗时", du.p95 || {}, fmtDur, { goodUp: false })}
+    ${deltaStat("最慢用例", du.max || {}, fmtDur, { goodUp: false })}
+  </div>
+  <div class="mt muted" style="font-size:13px">
+    覆盖行 ${(cov.covered_lines||{}).baseline ?? "—"} → <strong>${(cov.covered_lines||{}).current ?? "—"}</strong>
+    （${(((cov.covered_lines||{}).delta) >= 0 ? "+" : "") + ((cov.covered_lines||{}).delta ?? 0)}）
+    · 缺陷总数 ${bs.total ?? 0} → <strong>${cs.total ?? 0}</strong>
+    （${(((ds.total_delta) >= 0 ? "+" : "") + (ds.total_delta ?? 0))}）
+    · 新增缺陷 <strong style="color:${(de.opened||[]).length?'var(--red)':'inherit'}">${(de.opened||[]).length}</strong>
+    · 状态流转 <strong>${(de.status_changed||[]).length}</strong>
+  </div>
+  ${(fl.new||[]).length ? `<div class="mt"><h3>相对基线新增失败 <span class="pill new">${fl.new.length}</span></h3><table>
+    <thead><tr><th>用例</th><th>状态</th><th>原因</th><th>耗时</th></tr></thead><tbody>
+    ${fl.new.map(f => `<tr><td>${esc(f.case_name||f.case_id)}</td><td>${statusBadge(f.status)}</td>
+      <td class="muted" style="font-size:13px">${esc(f.reason||"")}</td><td>${fmtDur(f.duration)}</td></tr>`).join("")}
+  </tbody></table></div>` : ""}
+  ${(fl.fixed||[]).length ? `<div class="mt"><h3>基线失败、本次已通过 <span class="pill fixed">${fl.fixed.length}</span></h3><table>
+    <thead><tr><th>用例</th><th>基线状态</th></tr></thead><tbody>
+    ${fl.fixed.map(f => `<tr><td>${esc(f.case_name||f.case_id)}</td><td>${statusBadge(f.status)}</td></tr>`).join("")}
+  </tbody></table></div>` : ""}
+  ${(de.opened||[]).length ? `<div class="mt"><h3>新增缺陷</h3><table>
+    <thead><tr><th>标题</th><th>严重级</th><th>状态</th></tr></thead><tbody>
+    ${de.opened.map(x => `<tr><td>${esc(x.title)}</td><td><span class="tag">${esc(x.severity)}</span></td><td>${esc(x.status)}</td></tr>`).join("")}
+  </tbody></table></div>` : ""}
+  ${(de.status_changed||[]).length ? `<div class="mt"><h3>缺陷状态流转</h3><table>
+    <thead><tr><th>标题</th><th>基线时</th><th>当前</th></tr></thead><tbody>
+    ${de.status_changed.map(x => `<tr><td>${esc(x.title)}</td><td>${esc(x.baseline_status)}</td><td>${esc(x.current_status)}</td></tr>`).join("")}
+  </tbody></table></div>` : ""}
+  ${fl.truncated ? `<div class="mt muted" style="font-size:12px">失败用例较多，明细仅保留前 200 条用于对比。</div>` : ""}`;
+}
+
+$("#btn-save-baseline").onclick = async () => {
+  if (!currentBuild) { toast("请先选择一个构建", "error"); return; }
+  const build = builds.find(b => b.id === currentBuild);
+  if (build && ["pending", "running"].includes(build.status)) {
+    toast("构建尚未结束，不能固化为基线", "error"); return;
+  }
+  const defaultTag = "v" + new Date().toISOString().slice(0, 10);
+  const tag = prompt("给这条发布基线打个标签（如版本号 v2.3.0）：", defaultTag);
+  if (tag == null) return;
+  const description = prompt("备注（可留空）：", "") || "";
+  try {
+    await api(`/api/projects/${projectId}/baselines`, {
+      method: "POST", body: { build_id: currentBuild, tag: tag.trim(), description }
+    });
+    toast(`已固化基线 ${tag.trim()}`);
+    await loadBaselines(false);
+    currentBaselineId = (baselines.find(b => b.tag === tag.trim()) || {}).id || currentBaselineId;
+    $("#baseline-select").value = currentBaselineId || "";
+    if (currentBaselineId) localStorage.setItem(blKey(), currentBaselineId);
+    renderBaselineDiff();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("#btn-manage-baselines").onclick = async () => {
+  await loadBaselines(false);
+  if (!baselines.length) { toast("当前项目还没有基线，先在报告里「存为基线」", "error"); return; }
+  const lines = baselines.map((b, i) =>
+    `${i + 1}. [${b.tag}] 构建 ${b.build_name||b.build_id} · 通过率 ${b.pass_rate}% · 覆盖率 ${b.coverage_percent}% · ${fmtTime(b.frozen_at)}`
+  ).join("\n");
+  const choice = prompt(
+    `本项目已有 ${baselines.length} 条基线：\n${lines}\n\n` +
+    `输入序号删除该基线（将二次确认），其它输入取消：`, "");
+  if (choice == null || choice.trim() === "") return;
+  const idx = Number(choice.trim()) - 1;
+  const b = baselines[idx];
+  if (!b) { toast("序号无效", "error"); return; }
+  if (!confirm(`确认删除基线 ${b.tag}？该操作不可恢复（不影响原构建数据）。`)) return;
+  await api(`/api/baselines/${b.id}`, { method: "DELETE" });
+  if (currentBaselineId === b.id) { currentBaselineId = null; localStorage.removeItem(blKey()); }
+  toast("基线已删除");
+  await loadBaselines(false);
+};
 
 function renderReport(r) {
   $("#report-title").textContent = r.name || r.build_id;

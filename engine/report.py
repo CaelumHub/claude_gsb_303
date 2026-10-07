@@ -57,6 +57,18 @@ class ReportGenerator:
             store.write_report(build_id, report)
         return report
 
+    def compute_report(self, project_id: str, build_id: str) -> dict:
+        """只按当前结果计算报告，**不读写缓存**。
+
+        发布基线固化时需要一份与报告页同口径、但不影响 ``report.json``
+        缓存的快照（固化动作不应改动其它数据源），因此走这里。
+        """
+        store = self.builds.for_project(project_id)
+        build = store.get(build_id)
+        if build is None:
+            return {"error": "构建不存在"}
+        return self._compute(store, build_id, build)
+
     def _compute(self, store, build_id: str, build: dict) -> dict:
         total = build.get("total", 0)
         passed = build.get("passed", 0)

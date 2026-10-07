@@ -21,7 +21,7 @@ if BASE_DIR not in sys.path:
 
 from engine import (Scheduler, TestExecutor, EnvironmentManager,          # noqa: E402
                     CoverageAnalyzer, ReportGenerator, DefectManager,
-                    NotificationManager)
+                    BaselineManager, NotificationManager)
 from storage import StoreRegistry, BuildStoreRegistry                       # noqa: E402
 from web import api                                                         # noqa: E402
 from web.seed import seed_demo_data                                         # noqa: E402
@@ -44,6 +44,8 @@ def create_app(data_root: str | None = None) -> Flask:
     coverage = CoverageAnalyzer(build_registry)
     report_gen = ReportGenerator(build_registry)
     defects = DefectManager(registry)
+    baselines = BaselineManager(registry, build_registry, report_gen,
+                                coverage, defects)
     notify = NotificationManager(registry)
     scheduler = Scheduler(
         registry, build_registry, executor, env_manager,
@@ -60,6 +62,7 @@ def create_app(data_root: str | None = None) -> Flask:
     app.config["COVERAGE"] = coverage
     app.config["REPORT_GEN"] = report_gen
     app.config["DEFECTS"] = defects
+    app.config["BASELINES"] = baselines
     app.config["NOTIFY"] = notify
     app.config["JSON_AS_ASCII"] = False
 

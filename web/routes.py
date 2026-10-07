@@ -16,6 +16,7 @@ from typing import Optional
 from flask import Blueprint, current_app, jsonify, request
 
 from engine import new_id
+from engine.baselines import BaselineManager
 from engine.executor import TestExecutor
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -51,6 +52,10 @@ def _coverage():
 
 def _defects():
     return current_app.config["DEFECTS"]
+
+
+def _baselines():
+    return current_app.config["BASELINES"]
 
 
 def _notify():
@@ -465,6 +470,95 @@ def build_coverage(build_id: str):
 @api.get("/projects/<project_id>/coverage/trend")
 def coverage_trend(project_id: str):
     return jsonify(_coverage().trend(project_id))
+
+
+# ---------------------------------------------------------------------------
+# 发布基线：固化 / 管理 / 多源对比
+# ---------------------------------------------------------------------------
+
+@api.get("/projects/<project_id>/baselines")
+def list_baselines(project_id: str):
+    return jsonify({"baselines": _baselines().list(project_id)})
+
+
+@api.post("/projects/<project_id>/baselines")
+def create_baseline(project_id: str):
+    """把一场已结束构建的三来源结果固化为带标签的发布基线。"""
+    data = _payload()
+    build_id = (data.get("build_id") or "").strip()
+    tag = (data.get("tag") or "").strip()
+    if not build_id:
+        return _err("请选择要固化的构建")
+    if not tag:
+        return _err("基线标签不能为空（如版本号 v2.3.0）")
+    try:
+        baseline = _baselines().create(
+            project_id, build_id, tag,
+            description=data.get("description", ""))
+    except Exception as exc:  # BaselineError：构建不存在 / 未结束 / 标签重复
+        return _err(str(exc), 400)
+    return jsonify(BaselineManager.summary(baseline))
+
+
+@api.get("/baselines/<baseline_id>")
+def get_baseline(baseline_id: str):
+    baseline = _baselines().get(baseline_id)
+    if baseline is None:
+        return _err("基线不存在", 404)
+    return jsonify(baseline)
+
+
+@api.put("/baselines/<baseline_id>")
+def update_baseline(baseline_id: str):
+    if _baselines().get(baseline_id) is None:
+        return _err("基线不存在", 404)
+    data = _payload()
+    try:
+        baseline = _baselines().update_meta(baseline_id, data)
+    except Exception as exc:  # 标签为空 / 与其它基线冲突
+        return _err(str(exc), 400)
+    return jsonify(BaselineManager.summary(baseline))
+
+
+@api.delete("/baselines/<baseline_id>")
+def delete_baseline(baseline_id: str):
+    if not _baselines().delete(baseline_id):
+        return _err("基线不存在", 404)
+    return jsonify({"ok": True})
+
+
+@api.get("/builds/<build_id>/baseline-compare")
+def build_baseline_compare(build_id: str):
+    """当前构建相对历史基线的全套差异（报告页用）。"""
+    build, err = _build_or_404(build_id)
+    if err:
+        return err
+    baseline_id = request.args.get("baseline_id")
+    if not baseline_id:
+        return _err("请指定 baseline_id")
+    try:
+        diff = _baselines().compare_build(
+            build["project_id"], build_id, baseline_id)
+    except Exception as exc:
+        return _err(str(exc), 400)
+    return jsonify(diff)
+
+
+@api.get("/builds/<build_id>/baseline-compare/coverage")
+def build_baseline_compare_coverage(build_id: str):
+    """当前构建相对基线的覆盖率差异（覆盖率页用）。"""
+    build, err = _build_or_404(build_id)
+    if err:
+        return err
+    baseline_id = request.args.get("baseline_id")
+    if not baseline_id:
+        return _err("请指定 baseline_id")
+    try:
+        diff = _baselines().compare_coverage(
+            build["project_id"], build_id, baseline_id)
+    except Exception as exc:
+        return _err(str(exc), 400)
+    return jsonify(diff)
 
 
 # ---------------------------------------------------------------------------

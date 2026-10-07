@@ -26,9 +26,18 @@
         <label style="margin:0 6px 0 0;align-self:center">项目</label>
         <select id="project-select" style="max-width:240px" onchange="switchProject(this.value)"></select>
         <span style="flex:1"></span>
+        <label style="margin:0 6px 0 0;align-self:center">对比基线</label>
+        <select id="baseline-select" style="max-width:240px" onchange="onBaselineChange(this.value)"></select>
+        <button class="btn small secondary" id="btn-save-baseline">当前构建存为基线…</button>
         <button class="btn secondary" id="btn-refresh">刷新</button>
       </div>
+      <div class="muted mt" id="baseline-meta" style="font-size:12px"></div>
     </div>
+
+    <section class="diff-card" id="baseline-diff-card" style="display:none">
+      <h2 style="margin:0 0 10px">覆盖率相对基线</h2>
+      <div id="baseline-diff"><div class="empty" style="padding:10px 0">加载中…</div></div>
+    </section>
 
     <div class="grid cols-2">
       <section class="card">
@@ -56,6 +65,10 @@ renderNav("coverage");
 let projectId = null;
 let builds = [];
 let currentBuild = null;
+let baselines = [];
+let currentBaselineId = null;
+
+function blKey() { return `baseline:coverage:${projectId}`; }
 
 async function init() {
   const params = new URLSearchParams(location.search);
@@ -64,11 +77,39 @@ async function init() {
   if (builds[0]) selectBuild(builds[0].id);
 }
 
-async function switchProject(id) { projectId = id; currentBuild = null; await loadAll(); }
+async function switchProject(id) {
+  projectId = id; currentBuild = null; currentBaselineId = null;
+  await loadAll();
+  if (builds[0]) selectBuild(builds[0].id);
+}
 
 async function loadAll() {
   if (!projectId) return;
-  await Promise.all([loadBuilds(), loadTrend()]);
+  await Promise.all([loadBuilds(), loadTrend(), loadBaselines()]);
+}
+
+async function loadBaselines() {
+  const d = await api(`/api/projects/${projectId}/baselines`);
+  baselines = d.baselines || [];
+  const sel = $("#baseline-select");
+  if (!baselines.length) {
+    sel.innerHTML = '<option value="">（暂无基线）</option>';
+    currentBaselineId = null;
+  } else {
+    const saved = localStorage.getItem(blKey());
+    sel.innerHTML = '<option value="">不对比</option>' + baselines.map(b =>
+      `<option value="${b.id}">${esc(b.tag)} · 覆盖率 ${b.coverage_percent}%</option>`).join("");
+    currentBaselineId = (saved && baselines.some(b => b.id === saved)) ? saved : baselines[0].id;
+    sel.value = currentBaselineId;
+    localStorage.setItem(blKey(), currentBaselineId);
+  }
+}
+
+async function onBaselineChange(value) {
+  currentBaselineId = value || null;
+  if (currentBaselineId) localStorage.setItem(blKey(), currentBaselineId);
+  else localStorage.removeItem(blKey());
+  renderCoverageBaselineDiff();
 }
 
 async function loadBuilds() {
@@ -99,7 +140,69 @@ async function selectBuild(id) {
   loadBuilds();
   const c = await api(`/api/builds/${id}/coverage`);
   renderCoverage(c);
+  renderCoverageBaselineDiff();
 }
+
+async function renderCoverageBaselineDiff() {
+  const card = $("#baseline-diff-card");
+  const host = $("#baseline-diff");
+  const meta = $("#baseline-meta");
+  meta.textContent = "";
+  if (!currentBaselineId || !currentBuild) { card.style.display = "none"; return; }
+  const bl = baselines.find(b => b.id === currentBaselineId);
+  if (bl) meta.textContent = `基线 ${bl.tag} 固化于 ${fmtTime(bl.frozen_at)} · 基线覆盖率 ${bl.coverage_percent}%`;
+  card.style.display = "";
+  host.innerHTML = '<div class="empty" style="padding:10px 0">对比中…</div>';
+  let d;
+  try {
+    d = await api(`/api/builds/${currentBuild}/baseline-compare/coverage?baseline_id=${currentBaselineId}`);
+  } catch (e) { host.innerHTML = `<div class="empty" style="padding:10px 0;color:var(--red)">${esc(e.message)}</div>`; return; }
+  const cov = d.coverage || {}, p = cov.percent || {}, lines = cov.covered_lines || {};
+  const files = cov.files || [];
+  host.innerHTML = `
+    <div class="grid cols-3">
+      ${deltaStat("总体覆盖率", p, x => (x == null ? "—" : Number(x).toFixed(1) + "%"), { suffix: "%", goodUp: true })}
+      ${deltaStat("覆盖行数", { baseline: lines.baseline || 0, current: lines.current || 0,
+        delta: lines.delta || 0 }, x => x, { suffix: "", goodUp: true, digits: 0 })}
+      <div class="stat"><div class="v" style="font-size:18px">${files.filter(f => (f.delta||0) > 0).length}
+        <span style="color:var(--green);font-size:12px;font-weight:600">升</span> /
+        ${files.filter(f => (f.delta||0) < 0).length} <span style="color:var(--red);font-size:12px;font-weight:600">降</span></div>
+        <div class="k">逐文件：上升 / 下降（共 ${files.length} 个文件）</div></div>
+    </div>
+    <div class="mt">${files.map(f => {
+      const cur = f.current_percent, base = f.baseline_percent;
+      const dl = f.delta == null ? '<span class="delta zero">新增/缺失</span>' : deltaSpan(f.delta, { suffix: "%", goodUp: true });
+      const pct = v => v == null ? 0 : Math.max(0, Math.min(100, v));
+      return `<div class="cov-row">
+        <span class="fname" title="${esc(f.file)}">${esc(f.file)}</span>
+        <div class="bar ${cur>=80?'green':cur>=50?'amber':'red'}"><i style="width:${pct(cur)}%"></i></div>
+        <span class="pct">${cur==null?'—':cur+'%'}</span>
+        <span style="width:150px;font-size:11.5px" class="mono">基线 ${base==null?'—':base+'%'} ${dl}</span>
+      </div>`;
+    }).join("")}</div>`;
+}
+
+$("#btn-save-baseline").onclick = async () => {
+  if (!currentBuild) { toast("请先选择一个构建", "error"); return; }
+  const build = builds.find(b => b.id === currentBuild);
+  if (build && ["pending", "running"].includes(build.status)) {
+    toast("构建尚未结束，不能固化为基线", "error"); return;
+  }
+  const tag = prompt("给这条发布基线打个标签（如版本号 v2.3.0）：",
+    "v" + new Date().toISOString().slice(0, 10));
+  if (tag == null) return;
+  try {
+    await api(`/api/projects/${projectId}/baselines`, {
+      method: "POST", body: { build_id: currentBuild, tag: tag.trim() }
+    });
+    toast(`已固化基线 ${tag.trim()}`);
+    await loadBaselines();
+    currentBaselineId = (baselines.find(b => b.tag === tag.trim()) || {}).id || currentBaselineId;
+    $("#baseline-select").value = currentBaselineId || "";
+    if (currentBaselineId) localStorage.setItem(blKey(), currentBaselineId);
+    renderCoverageBaselineDiff();
+  } catch (e) { toast(e.message, "error"); }
+};
 
 function renderCoverage(c) {
   $("#cov-title").textContent = `覆盖率详情 · ${c.percent}%`;

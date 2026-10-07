@@ -174,3 +174,29 @@ function progressBar(ratio, cls = "") {
   const pct = Math.max(0, Math.min(100, Math.round(ratio * 100)));
   return `<div class="bar ${cls}"><i style="width:${pct}%"></i></div>`;
 }
+
+/* ============================================================
+   发布基线对比：差异徽标与取值工具（报告页 / 覆盖率页共用）
+   ============================================================ */
+
+/* 差值着色：goodUp=true 时「上升为好」（通过率、覆盖率）；
+   反之「下降为好」（失败数、耗时）。 */
+function deltaSpan(delta, { suffix = "", goodUp = true, digits = 1, zero = "持平" } = {}) {
+  const d = Number(delta || 0);
+  if (Math.abs(d) < 0.05) return `<span class="delta zero">${zero}</span>`;
+  const good = goodUp ? d > 0 : d < 0;
+  const cls = good ? "up" : "down";
+  const arrow = d > 0 ? "▲" : "▼";
+  const v = Math.abs(d).toFixed(digits);
+  return `<span class="delta ${cls}">${arrow} ${v}${suffix}</span>`;
+}
+
+/* 渲染「基线值 → 当前值（差值）」一行，用于对比统计块。 */
+function deltaStat(label, node, fmt = x => x, opts = {}) {
+  const bv = fmt(node.baseline);
+  const cv = fmt(node.current);
+  return `<div class="stat">
+    <div class="v" style="font-size:18px">${cv} <span style="font-size:12px;font-weight:500">${deltaSpan(node.delta, opts)}</span></div>
+    <div class="k">${label} · 基线 ${bv}</div>
+  </div>`;
+}
